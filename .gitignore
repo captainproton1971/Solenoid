@@ -1,0 +1,15 @@
+.Rhistory
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+# renv
+renv/library/
+renv/staging/
+.Rprofile # keep this if you use renv (see note below)
+# rsconnect deployment artifacts
+rsconnect/
+# OS cruft
+.DS_Store
+Thumbs.db
+
