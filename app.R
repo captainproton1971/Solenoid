@@ -1,422 +1,401 @@
-# Solenoid analysis
-# Michael Dugdale (revised)
+# Solenoid analysis — refactored Shiny app
+#
+# Uses york_lm.R (placed alongside this app.R).
+# Model-selection policy is deliberately unchanged from the original:
+#   quadratic + intercept -> possibly quadratic through origin ->
+#   linear + intercept -> possibly linear through origin.
+#
+# All displayed coefficient estimates, SEs, p-values, and confidence
+# intervals are taken from the model that is actually selected.
 
 library(shiny)
-library(tidyverse)
 library(ggplot2)
 library(readxl)
 
-## ---------- Utilities ----------
+source("./R/york_lm.R", local = TRUE)
+
+ALPHA <- 0.05
+TEMPLATE_FILE <- file.path("www", "Solenoid_data_template.xlsx")
+
+## -------------------- Formatting helpers --------------------
 
 superscript <- function(n) {
-  map <- c('0'='⁰','1'='¹','2'='²','3'='³','4'='⁴',
-           '5'='⁵','6'='⁶','7'='⁷','8'='⁸','9'='⁹','-'='⁻','+'='⁺')
-  paste0(unname(map[strsplit(as.character(n), NULL)[[1]]]), collapse='')
+  chars <- c("0" = "⁰", "1" = "¹", "2" = "²", "3" = "³", "4" = "⁴",
+             "5" = "⁵", "6" = "⁶", "7" = "⁷", "8" = "⁸", "9" = "⁹",
+             "-" = "⁻", "+" = "⁺")
+  paste0(unname(chars[strsplit(as.character(n), "", fixed = TRUE)[[1L]]]),
+         collapse = "")
 }
 
-format_ci_sci <- function(ci, digits = 2, threshold = 0.1, superscript = FALSE) {
-  # ci: numeric vector of length 2
-  stopifnot(length(ci) == 2)
+# Avoid rounding a p-value across the 0.05 decision boundary.
+format_p <- function(p, alpha = ALPHA) {
+  if (length(p) != 1L || !is.finite(p) || p < 0 || p > 1) return("NA")
+  if (p < 1e-12) return("< 1e-12")
+  for (digits in 4:15) {
+    label <- sprintf("%.*g", digits, p)
+    shown <- suppressWarnings(as.numeric(label))
+    if (is.finite(shown) && (shown < alpha) == (p < alpha)) {
+      return(label)
+    }
+  }
+  if (p < alpha) "< 0.05" else "≥ 0.05"
+}
+
+format_ci_sci <- function(ci, digits = 2L, threshold = 0.1) {
+  stopifnot(length(ci) == 2L)
   if (any(!is.finite(ci))) return("NA")
+  if (all(ci == 0)) return("[0, 0]")
 
-  sup_map <- c('0'='⁰','1'='¹','2'='²','3'='³','4'='⁴',
-               '5'='⁵','6'='⁶','7'='⁷','8'='⁸','9'='⁹','-'='⁻','+'='⁺')
-  to_sup <- function(n) paste0(unname(sup_map[strsplit(as.character(n), NULL)[[1]]]), collapse='')
+  largest <- max(abs(ci))
+  sci <- largest < threshold || largest >= 1e4
+  exponent <- if (sci) floor(log10(largest)) else 0L
+  scaled <- ci / 10^exponent
 
-  # Absolute values for exponent computation
-  exps <- floor(log10(abs(ci)))
-  exp_ref <- min(exps)  # shared exponent (typically the smaller)
-  mant <- ci / (10^exp_ref)
-
-  # Determine whether to switch to scientific notation
-  use_sci <- abs(mean(ci)) < threshold || exp_ref != 0
-
-  # Find minimal digits where the rounded values differ
-  digits_needed <- digits
-  while (digits_needed < 6 &&
-         round(mant[1], digits_needed) == round(mant[2], digits_needed)) {
-    digits_needed <- digits_needed + 1
+  # Ensure close endpoints remain distinguishable and small nonzero bounds
+  # are not silently rounded to zero.
+  places <- as.integer(digits)
+  while (places < 12L &&
+         (round(scaled[1L], places) == round(scaled[2L], places) ||
+          any(round(scaled, places) == 0 & scaled != 0))) {
+    places <- places + 1L
   }
 
-  # Format mantissas with equal width
-  fmt <- paste0("%.", digits_needed, "f")
-  mant_str <- sprintf(fmt, mant)
-
-  if (use_sci) {
-    if (superscript) {
-      suffix <- paste0(" × 10", superscript(exp_ref))
-    } else {
-      suffix <- paste0(" × 10", superscript(exp_ref))
-    }
-    paste0("[", mant_str[1], ", ", mant_str[2], "]", suffix)
-  } else {
-    paste0("[", mant_str[1], ", ", mant_str[2], "]")
-  }
+  fmt <- paste0("%.", places, "f")
+  limits <- sprintf(fmt, scaled)
+  label <- paste0("[", limits[1L], ", ", limits[2L], "]")
+  if (sci) paste0(label, " × 10", superscript(exponent)) else label
 }
 
+# Parentheses notation: 1.23(4) × 10⁻³ means (1.23 ± 0.04) × 10⁻³.
+pretty_uncert <- function(value, se, sci_threshold = 0.1) {
+  one <- function(x, dx) {
+    if (!is.finite(x) || !is.finite(dx) || dx < 0) return("NA")
+    if (dx == 0) return(sprintf("%.5g", x))
 
+    leading <- dx / 10^floor(log10(dx))
+    sig <- if (leading < 2) 2L else 1L
+    dx_rounded <- signif(dx, sig)
 
-pretty_uncert <- function(x, dx, sci_threshold = 0.1, superscripts = TRUE) {
-  sup_map <- c('0'='⁰','1'='¹','2'='²','3'='³','4'='⁴',
-               '5'='⁵','6'='⁶','7'='⁷','8'='⁸','9'='⁹','-'='⁻','+'='⁺')
-  to_sup <- function(n) paste0(unname(sup_map[strsplit(as.character(n), NULL)[[1]]]), collapse='')
+    sci <- max(abs(x), dx_rounded) >= 1e4 ||
+      max(abs(x), dx_rounded) < sci_threshold
+    exponent <- if (sci) floor(log10(max(abs(x), dx_rounded))) else 0L
+    scale <- 10^exponent
+    uncertainty_scaled <- dx_rounded / scale
+    places <- max(0L, as.integer(sig - 1L - floor(log10(uncertainty_scaled))))
 
-  fmt_one <- function(xi, dxi) {
-    if (!is.finite(xi) || !is.finite(dxi) || dxi <= 0) return("NA")
+    value_str <- sprintf(paste0("%.", places, "f"), x / scale)
+    digits_str <- sprintf("%.0f", round(uncertainty_scaled * 10^places))
+    result <- paste0(value_str, "(", digits_str, ")")
+    if (sci) paste0(result, " × 10", superscript(exponent)) else result
+  }
+  mapply(one, value, se, USE.NAMES = FALSE)
+}
 
-    # --- choose sig figs for uncertainty: 1, unless leading digit would be 1 -> 2 ---
-    lead <- dxi / (10^floor(log10(dxi)))              # mantissa in [1,10)
-    k <- if (lead < 2) 2 else 1                        # digits to keep for dx
-    u <- signif(dxi, k)                                # rounded uncertainty
+## -------------------- Physics prediction --------------------
 
-    # --- decimals needed so that u * 10^p is an integer with k digits ---
-    p <- -floor(log10(u)) + (k - 1)                    # can be negative
-
-    # when to switch to scientific notation
-    use_sci <- (abs(xi) < sci_threshold) || (p < 0)
-
-    if (use_sci) {
-      ex <- if (xi == 0) floor(log10(u)) else floor(log10(abs(xi)))
-      m  <- xi / (10^ex)           # mantissa for x
-      um <- u  / (10^ex)           # mantissa-scaled uncertainty
-      q  <- -floor(log10(um)) + (k - 1)    # decimals for mantissa
-
-      s  <- 10^q
-      m_str <- sprintf(paste0("%.", max(0,q), "f"), round(m * s) / s)
-      paren_digits <- as.integer(round(um * s))        # k digits
-
-      if (superscripts) {
-        paste0(m_str, "(", paren_digits, ") × 10", to_sup(ex))
-      } else {
-        paste0(m_str, "(", paren_digits, ") × 10", superscript(ex))
-      }
-    } else {
-      # fixed notation with p decimals
-      s <- 10^p
-      x_str <- sprintf(paste0("%.", p, "f"), round(xi * s) / s)
-      paren_digits <- as.integer(round(u * s))         # k digits
-      paste0(x_str, "(", paren_digits, ")")
-    }
+pred_slope <- function(N, sN, L, sL) {
+  numbers <- c(N, sN, L, sL)
+  if (length(numbers) != 4L || any(!is.finite(numbers)) ||
+      N <= 0 || L <= 0 || sN < 0 || sL < 0) {
+    return(NULL)
   }
 
-  mapply(fmt_one, x, dx, USE.NAMES = FALSE)
+  mu0 <- 4 * pi * 1e-7  # T m / A
+  value <- mu0 * N / L
+  se <- abs(value) * sqrt((sN / N)^2 + (sL / L)^2)
+  list(value = value, se = se,
+       lwr = value - se, upr = value + se,
+       label = pretty_uncert(value, se))
 }
 
+## -------------------- Model fitting / selection --------------------
 
-
-pred_slope <- function(N, sN, L, sL){
-  # Predicted slope v = mu0*N/L and its propagated uncertainty.
-  mu_0 <- 4*pi*1.0e-7
-  v <- mu_0*N/L
-  u <- abs(v) * sqrt( (sN/N)^2 + (sL/L)^2 )
-  if (is.finite(v) && is.finite(u)){
-    list(pretty_uncert(v,u), v - u, v + u)
-  } else {
-    list(Inf, Inf, Inf)
-  }
-}
-
-## ---------- Model selection ----------
-# Helper to safely extract p-values
-coef_p <- function(smry, name) smry$coefficients[name, "Pr(>|t|)"]
-coef_est <- function(smry, name) smry$coefficients[name, "Estimate"]
-coef_se  <- function(smry, name) smry$coefficients[name, "Std. Error"]
-
-format_p <- function(p){
-  if (!is.finite(p)) return("NA")
-  pos <- max(1, -floor(log10(p)) + 1)
-  round(p*10^pos)/10^pos
-}
-
-make_model <- function(data){
-  # data must have: current, sx, field, sy
-  # Try quadratic with intercept
-  qmodel <- york_poly_fit(
-    x = data$current, y = data$field, sx = data$sx, sy = data$sy,
-    degree = 2L, intercept = TRUE, estimate_sigma_int = TRUE, standardize=TRUE
+fit_candidate <- function(data, degree, intercept) {
+  model <- york_poly_fit(
+    x = data$current, y = data$field,
+    sx = data$sx, sy = data$sy,
+    degree = as.integer(degree), intercept = intercept,
+    estimate_sigma_int = TRUE, standardize = TRUE
   )
-  qsm <- summary(qmodel)
+  list(model = model, stats = summary(model),
+       degree = degree, intercept = intercept)
+}
 
-  # Is quadratic significant?
-  quad_p <- tryCatch(coef_p(qsm, "I(x^2)"), error = \(e) NA_real_)
-  quad_sig <- is.finite(quad_p) && quad_p < 0.05
+coef_p <- function(candidate, term) {
+  tab <- candidate$stats$coefficients
+  if (!term %in% rownames(tab)) return(NA_real_)
+  unname(as.numeric(tab[term, "Pr(>|t|)"]))
+}
 
-  if (quad_sig){
-    # Is intercept significant?
-    int_p <- tryCatch(coef_p(qsm, "(Intercept)"), error = \(e) NA_real_)
-    int_sig <- is.finite(int_p) && int_p < 0.05
+is_significant <- function(p, alpha = ALPHA) {
+  is.finite(p) && p < alpha
+}
 
+# A screening record identifies exactly which *candidate* supplied a test.
+screening_record <- function(candidate, term) {
+  list(
+    term = term,
+    p = coef_p(candidate, term),
+    description = paste0(
+      if (candidate$degree == 2L) "quadratic" else "linear",
+      if (candidate$intercept) " with intercept" else " through origin"
+    )
+  )
+}
 
-    if (int_sig){
-      # quad1
-      slope_val <- coef_est(qsm, "x"); slope_u <- coef_se(qsm, "x")
-      quad_val  <- coef_est(qsm, "I(x^2)"); quad_u <- coef_se(qsm, "I(x^2)")
-      int_val   <- coef_est(qsm, "(Intercept)"); int_u <- coef_se(qsm, "(Intercept)")
-      r_sq <- round(qsm$adj.r.squared, 4)
+make_model <- function(data) {
+  # Start from the most general candidate, as in the original application.
+  q1 <- fit_candidate(data, degree = 2L, intercept = TRUE)
+  quadratic_test <- screening_record(q1, "I(x^2)")
+  intercept_test <- NULL
 
-      ci_quad <- tryCatch(confint(qmodel)["I(x^2)",], error = \(e) c(NA,NA))
-      ci_slope <- tryCatch(confint(qmodel)["x",], error = \(e) c(NA,NA))
-      ci_int <- tryCatch(confint(qmodel)["(Intercept)",], error = \(e) c(NA,NA))
-      strings <- paste(
-        "The model is quadratic with a significant (non-zero) intercept.",
-        paste0(
-          "\nQuadratic term: p = ", format_p(quad_p),
-          " < 0.05 (significant).  \n\tValue = ",
-          pretty_uncert(quad_val, quad_u),
-          " (T/A", superscript(2), ")."
-        ),
-        paste0("\t95% CI (quadratic): ", format_ci_sci(ci_slope)),
-        paste0("\nLinear term: \n\tvalue = ", pretty_uncert(slope_val, slope_u), "T/A."),
-        paste0("\t95% CI (slope): ",format_ci_sci(ci_slope), " T/A."),
-        paste0("\nIntercept: p = ", format_p(int_p), " < 0.05 (significant).  \n\tValue = ",
-               pretty_uncert(int_val, int_u), " (T)."
-               ),
-        paste0("\t95% CI (intercept): ", format_ci_sci(ci_int)),
-        paste0("\nAdjusted R", superscript(2), ": ", r_sq),
-        sep = "\n"
-      )
-      return(list(type = "quad1", model = qmodel, summary = strings))
-    } else {
-      # Refit quadratic without intercept; keep only if quad still significant
-      q0 <- york_poly_fit(
-        x = data$current, y = data$field, sx = data$sx, sy = data$sy,
-        degree = 2L, intercept = FALSE, estimate_sigma_int = TRUE, standardize=TRUE
-      )
-      q0sm <- summary(q0)
-      quad_p2 <- tryCatch(q0sm$coefficients["I(x^2)", "Pr(>|t|)"], error = \(e) NA_real_)
-      if (is.finite(quad_p2) && quad_p2 < 0.05){
-        # quad0
-        slope_val <- q0sm$coefficients["x", "Estimate"]; slope_u <- q0sm$coefficients["x", "Std. Error"]
-        quad_val  <- q0sm$coefficients["I(x^2)", "Estimate"]; quad_u <- q0sm$coefficients["I(x^2)", "Std. Error"]
-        r_sq <- round(q0sm$adj.r.squared, 4)
-        ci_slope <- tryCatch(confint(q0)["x",], error = \(e) c(NA,NA))
-        strings <- paste(
-          "The model is quadratic with no significant intercept (intercept fixed to 0).",
-          paste0(
-            "\nQuadratic term: p = ", format_p(quad_p),
-            " < 0.05 (significant).  \n\tvalue = ",
-            pretty_uncert(quad_val, quad_u),
-            " (T/A", superscript(2), ")."
-          ),
-          paste0("\t95% CI (quadratic): ", format_ci_sci(ci_slope)),
-          paste0("\nLinear term: \n\tvalue = ", pretty_uncert(slope_val, slope_u), "T/A."),
-          paste0("\t95% CI (slope): ", format_ci_sci(ci_slope)," T/A."),
-          paste0("\nIntercept: p = ", format_p(int_p), " ≥ 0.05 (does not differ significantly from 0)."),
-          paste0("\nAdjusted R", superscript(2), ": ", r_sq),
-          sep = "\n"
-        )
-        return(list(type = "quad0", model = q0, summary = strings))
-      }
+  if (is_significant(quadratic_test$p)) {
+    intercept_test <- screening_record(q1, "(Intercept)")
+    if (is_significant(intercept_test$p)) {
+      return(finish_model("quad1", q1, quadratic_test, intercept_test))
+    }
+
+    # Refit before retesting curvature. Do not reuse q1's p-value.
+    q0 <- fit_candidate(data, degree = 2L, intercept = FALSE)
+    quadratic_test <- screening_record(q0, "I(x^2)")
+    if (is_significant(quadratic_test$p)) {
+      return(finish_model("quad0", q0, quadratic_test, intercept_test))
     }
   }
 
-  # Linear with intercept
-  lmodel <- york_poly_fit(
-    x = data$current, y = data$field, sx = data$sx, sy = data$sy,
-    degree = 1L, intercept = TRUE, estimate_sigma_int = TRUE, standardize=TRUE
-  )
-  lsm <- summary(lmodel)
-
-  int_p <- tryCatch(coef_p(lsm, "(Intercept)"), error = \(e) NA_real_)
-
-  if (is.finite(int_p) && int_p < 0.05){
-    slope_val <- coef_est(lsm, "x"); slope_u <- coef_se(lsm, "x")
-    int_val   <- coef_est(lsm, "(Intercept)"); int_u <- coef_se(lsm, "(Intercept)")
-    r_sq <- round(lsm$adj.r.squared, 4)
-    ci <- confint(lmodel)
-    strings <- paste(
-      "The model is linear with a significant (non-zero) intercept.",
-      paste0("\nQuadratic term: p = ",format_p(quad_p), " ≥ 0.05 (not significant)."),
-      paste0("\nSlope: ", pretty_uncert(slope_val, slope_u), " T/A."),
-      paste0("\t95% CI (slope): ", format_ci_sci(ci["x",]), " T/A."),
-      paste0("\nIntercept: p = ", format_p(int_p), " < 0.05 (significant), \n\tvalue = ", pretty_uncert(int_val, int_u), " T."),
-      paste0("\t95% CI (intercept): ", format_ci_sci(ci["(Intercept)",]), " T"),
-      paste0("\nAdjusted R", superscript(2), ": ", r_sq),
-      sep = "\n"
-    )
-    return(list(type = "lin1", model = lmodel, summary = strings))
-  } else {
-    # Linear no intercept
-    l0 <- york_poly_fit(
-      x = data$current, y = data$field, sx = data$sx, sy = data$sy,
-      degree = 1L, intercept = FALSE, estimate_sigma_int = TRUE, standardize=TRUE
-    )
-    l0sm <- summary(l0)
-    slope_val <- l0sm$coefficients["x","Estimate"]; slope_u <- l0sm$coefficients["x","Std. Error"]
-    r_sq <- round(l0sm$adj.r.squared, 4)
-    ci_slope <- tryCatch(confint(l0)["x",], error = \(e) c(NA,NA))
-    strings <- paste(
-      "The model is linear with no significant intercept (intercept fixed to 0).",
-      paste0("\nQuadratic term: p = ",format_p(quad_p), " ≥ 0.05 (not significant)."),
-      paste0("\nSlope: ", pretty_uncert(slope_val, slope_u), " T/A."),
-      paste0("\t95% CI (slope): ", format_ci_sci(ci_slope)," T/A."),
-      paste0("\nIntercept: p = ", format_p(int_p), " ≥ 0.05 (does not differ significantly from 0)."),
-      paste0("\nAdjusted R", superscript(2), ": ", r_sq),
-      sep = "\n"
-    )
-    return(list(type = "lin0", model = l0, summary = strings))
+  # The latest quadratic screening record belongs to the candidate that
+  # determined the decision to proceed to a linear model.
+  l1 <- fit_candidate(data, degree = 1L, intercept = TRUE)
+  intercept_test <- screening_record(l1, "(Intercept)")
+  if (is_significant(intercept_test$p)) {
+    return(finish_model("lin1", l1, quadratic_test, intercept_test))
   }
+
+  l0 <- fit_candidate(data, degree = 1L, intercept = FALSE)
+  finish_model("lin0", l0, quadratic_test, intercept_test)
 }
 
-## ---------- Plotting ----------
-make_plot <- function(data, fitted){
-  # data must include: current, sx, field, sy
-  # fitted: list(type, model, summary)
-  x_label <- "Current I (A)"
-  y_label <- "Magnetic flux density B (T)"
+finish_model <- function(type, selected, quadratic_test, intercept_test) {
+  result <- list(
+    type = type,
+    model = selected$model,
+    quadratic_test = quadratic_test,
+    intercept_test = intercept_test
+  )
+  result$summary <- format_model_report(result)
+  result
+}
 
+## -------------------- One report for ALL model types --------------------
+
+format_coefficient <- function(tab, ci, term, title, unit) {
+  stopifnot(term %in% rownames(tab), term %in% rownames(ci))
+  estimate <- tab[term, "Estimate"]
+  se <- tab[term, "Std. Error"]
+  p <- tab[term, "Pr(>|t|)"]
+  paste0(
+    title, ": ", pretty_uncert(estimate, se), " ", unit,
+    "\n  95% CI: ", format_ci_sci(ci[term, ]), " ", unit,
+    "\n  p = ", format_p(p)
+  )
+}
+
+format_screen <- function(record, label) {
+  if (is.null(record)) return(NULL)
+  state <- if (!is.finite(record$p)) "test unavailable" else
+    if (is_significant(record$p)) "significant" else "not significant"
+  paste0(label, " (", record$description, "): p = ",
+         format_p(record$p), " (", state, ")")
+}
+
+format_model_report <- function(result) {
+  model <- result$model
+  tab <- summary(model)$coefficients
+  ci <- confint(model, level = 0.95)
+
+  title <- switch(
+    result$type,
+    quad1 = "Selected model: quadratic, fitted intercept",
+    quad0 = "Selected model: quadratic, intercept fixed at 0",
+    lin1 = "Selected model: linear, fitted intercept",
+    lin0 = "Selected model: linear, intercept fixed at 0"
+  )
+
+  lines <- c(title, "", "Selected-model coefficients (estimate and SE):")
+  if (model$intercept) {
+    lines <- c(lines, format_coefficient(tab, ci, "(Intercept)", "Intercept", "T"))
+  } else {
+    lines <- c(lines, "Intercept: fixed at 0 T (not estimated)")
+  }
+
+  lines <- c(lines, format_coefficient(tab, ci, "x", "Linear term", "T/A"))
+  if (model$degree == 2L) {
+    lines <- c(lines,
+               format_coefficient(tab, ci, "I(x^2)", "Quadratic term", "T/A²"))
+  }
+
+  adj <- summary(model)$adj.r.squared
+  lines <- c(lines, "", paste0("Adjusted weighted R²: ",
+                               if (is.finite(adj)) sprintf("%.4f", adj) else "NA"))
+
+  # Screening tests are clearly separated from selected-model inference.
+  # In linear models, the quadratic p-value comes from a REJECTED candidate.
+  if (model$degree == 1L) {
+    lines <- c(lines, "", "Model-selection diagnostics:",
+               format_screen(result$quadratic_test, "Quadratic-term screening"))
+  }
+  if (!model$intercept) {
+    if (model$degree == 2L) {
+      lines <- c(lines, "", "Model-selection diagnostics:")
+    }
+    lines <- c(lines, format_screen(result$intercept_test,
+                                    "Intercept screening before fixing it to zero"))
+  }
+  if (!isTRUE(model$converged)) {
+    lines <- c(lines, "", "WARNING: selected York fit reports nonconvergence.")
+  }
+  lines <- c(lines, "", "Note: p-values and 95% CIs are nominal; they do not",
+             "account for the preliminary model-selection tests.")
+  paste(lines, collapse = "\n")
+}
+
+## -------------------- Plotting --------------------
+
+make_plot <- function(data, fitted, theoretical = NULL) {
   p <- ggplot(data, aes(x = current, y = field)) +
     theme_minimal() +
-    geom_point(size = 1) +
-    geom_hline(yintercept = 0) +
-    geom_vline(xintercept = 0) +
-    xlab(x_label) + ylab(y_label) +
+    geom_hline(yintercept = 0, colour = "grey70") +
+    geom_vline(xintercept = 0, colour = "grey70") +
+    geom_segment(aes(x = current, xend = current,
+                     y = field - sy, yend = field + sy),
+                 linewidth = 0.35) +
+    geom_segment(aes(x = current - sx, xend = current + sx,
+                     y = field, yend = field),
+                 linewidth = 0.35) +
+    geom_point(size = 1.6) +
+    labs(x = "Current I (A)", y = "Magnetic flux density B (T)")
 
+  grid_x <- seq(min(0, data$current), max(0, data$current), length.out = 201L)
+  # predict.yorklm returns a named list with fit, lwr, upr, x.
+  pred <- predict(fitted$model, newdata = data.frame(x = grid_x),
+                  interval = "confidence", level = 0.95)
+  band <- data.frame(x = pred$x, fit = pred$fit,
+                     lwr = pred$lwr, upr = pred$upr)
 
-    geom_errorbar(
-      aes(ymin = field - sy, ymax = field + sy),
-      width = data$sx/2, orientation="x"
-    ) +
-    geom_errorbar(
-      aes(xmin = current - sx, xmax = current + sx),
-      width = data$sy/2,
-      orientation = "y"
-    )
+  p <- p +
+    geom_ribbon(data = band,
+                aes(x = x, ymin = lwr, ymax = upr),
+                inherit.aes = FALSE, fill = "royalblue", alpha = 0.16) +
+    geom_line(data = band, aes(x = x, y = fit),
+              inherit.aes = FALSE, colour = "royalblue", linewidth = 0.8)
 
-
-  # Prediction band from the fitted model
-  xg <- tibble(x = seq(0, max(data$current, na.rm = TRUE), length.out = 201))
-  names(xg) <- 'x'
-  pr <- tryCatch(
-    as_tibble(predict(fitted$model, newdata = xg, interval = "confidence")),
-    error = \(e) NULL
-  )
-
-  if (!is.null(pr) && all(c("fit","lwr","upr") %in% names(pr))){
-    band <- bind_cols(xg, pr[,-ncol(pr)])
+  if (!is.null(theoretical)) {
+    # Sort points and use pmin/pmax: correct even for negative currents.
+    xg <- sort(unique(c(0, data$current)))
+    lo <- xg * theoretical$lwr
+    hi <- xg * theoretical$upr
+    envelope <- data.frame(x = xg, ymin = pmin(lo, hi), ymax = pmax(lo, hi))
     p <- p +
-      geom_ribbon(data = band, aes(x = x, ymin = lwr, ymax = upr), inherit.aes = FALSE, alpha = 0.15, colour="blue") +
-      geom_line(data = band, aes(x = x, y = fit), inherit.aes = FALSE, linewidth = 0.8, colour="blue")
+      geom_ribbon(data = envelope, aes(x = x, ymin = ymin, ymax = ymax),
+                  inherit.aes = FALSE, fill = "forestgreen", alpha = 0.15)
   }
   p
 }
 
-## ---------- Shiny UI ----------
+## -------------------- Shiny UI --------------------
+
 ui <- fluidPage(
   titlePanel("Magnetic Field of a Solenoid"),
   mainPanel(
-      downloadButton('template_download', label = "Download data file template", icon = shiny::icon("download")),
-      fileInput('data_file', label = "Upload your completed Excel file",
-                multiple = FALSE, accept = '.xlsx',
-                buttonLabel = "Browse...", placeholder = "No file selected"),
-      verbatimTextOutput("LM"),
-      textOutput("predSlope"),
-      plotOutput("plot")
+    if (file.exists(TEMPLATE_FILE)) {
+      downloadButton("template_download", "Download data file template",
+                     icon = shiny::icon("download"))
+    } else {
+      helpText("Data-file template unavailable (expected at www/Solenoid_data_template.xlsx).")
+    },
+    fileInput("data_file", "Upload your completed Excel file",
+              multiple = FALSE, accept = ".xlsx",
+              buttonLabel = "Browse...", placeholder = "No file selected"),
+    verbatimTextOutput("LM"),
+    textOutput("predSlope"),
+    plotOutput("plot", height = "480px")
   )
 )
 
+## -------------------- Shiny server --------------------
 
-## ---------- Shiny server ----------
 server <- function(input, output, session) {
-
-  # Reactive: load and validate data
-  file_ok <- reactive({
+  uploaded_path <- reactive({
     req(input$data_file)
-    tools::file_ext(input$data_file$datapath) == "xlsx"
+    validate(need(tolower(tools::file_ext(input$data_file$name)) == "xlsx",
+                  "Please upload an .xlsx workbook."))
+    input$data_file$datapath
   })
 
   raw_df <- reactive({
-    req(file_ok())
-    df <- suppressMessages(suppressWarnings(read_xlsx(
-      input$data_file$datapath,
-      range = 'A3:D26',
-      col_names = FALSE,
-      na = "",
-      trim_ws = TRUE,
-      progress = FALSE,
-    )))
-    names(df) <- c("current", "sx", "field", "sy")
-    df %>%
-      mutate(across(everything(), as.numeric)) %>%
-      drop_na()
+    path <- uploaded_path()
+    dat <- suppressMessages(readxl::read_xlsx(
+      path, range = "A3:D26", col_names = FALSE,
+      na = "", trim_ws = TRUE, progress = FALSE
+    ))
+    names(dat) <- c("current", "sx", "field", "sy")
+    dat <- as.data.frame(lapply(dat, function(x) suppressWarnings(as.numeric(x))))
+    dat <- dat[complete.cases(dat), , drop = FALSE]
+
+    validate(
+      need(nrow(dat) >= 4L, "At least four complete data rows are needed in A3:D26."),
+      need(all(is.finite(as.matrix(dat))), "The data must contain only finite numeric values."),
+      need(all(dat$sx >= 0 & dat$sy >= 0), "The uncertainties sx and sy must be nonnegative."),
+      need(sd(dat$current) > 0, "The current values must not all be identical."),
+      need(sd(dat$field) > 0, "The field values must not all be identical.")
+    )
+    dat
   })
 
   params <- reactive({
-    req(file_ok())
-    # Read single cells using readxl
-    N  <- suppressMessages(suppressWarnings(
-      as.numeric(read_xlsx(input$data_file$datapath, range = "G3", col_names = FALSE)[[1,1]])
-      ))
-    sN <- suppressMessages(suppressWarnings(
-      as.numeric(read_xlsx(input$data_file$datapath, range = "H3", col_names = FALSE)[[1,1]])
-      ))
-    L  <- suppressMessages(suppressWarnings(
-      as.numeric(read_xlsx(input$data_file$datapath, range = "G4", col_names = FALSE)[[1,1]])
-      ))
-    sL <- suppressMessages(suppressWarnings(
-      as.numeric(read_xlsx(input$data_file$datapath, range = "H4", col_names = FALSE)[[1,1]])
-      ))
-    list(N=N, sN=sN, L=L, sL=sL)
+    path <- uploaded_path()
+    vals <- suppressMessages(readxl::read_xlsx(
+      path, range = "G3:H4", col_names = FALSE, progress = FALSE
+    ))
+    as_num <- function(row, col) {
+      suppressWarnings(as.numeric(vals[[col]][row]))
+    }
+    list(N = as_num(1L, 1L), sN = as_num(1L, 2L),
+         L = as_num(2L, 1L), sL = as_num(2L, 2L))
+  })
+
+  theoretical <- reactive({
+    p <- params()
+    pred_slope(p$N, p$sN, p$L, p$sL)
   })
 
   fitted <- reactive({
-    df <- raw_df()
-    validate(need(nrow(df) >= 3, "Not enough data rows in A3:D26"))
-    make_model(df)
+    make_model(raw_df())
   })
 
-  # Predicted slope text
-  output$predSlope <- renderText({
-    req(params())
-    with(params(), {
-      vals <- pred_slope(N, sN, L, sL)
-      if (!is.finite(as.numeric(vals[[3]]))){
-        "Upload your Excel file with cells G3:H4 completed to compute predicted slope."
-      } else {
-        paste0("Predicted slope: ", vals[[1]], " T/A")
-      }
-    })
-  })
-
-  # Model summary text (computed once)
   output$LM <- renderText({
-    req(fitted())
     fitted()$summary
   })
 
-  # Plot (uses the same fitted model)
-  output$plot <- renderPlot({
-    df <- raw_df()
-    fit <- fitted()
-
-    # Base plot with fit band
-    p <- make_plot(df, fit)
-
-    # Add predicted-slope envelope if available
-    vals <- with(params(), pred_slope(N, sN, L, sL))
-    slope_min <- as.numeric(vals[[2]])
-    slope_max <- as.numeric(vals[[3]])
-
-    if (is.finite(slope_min) && is.finite(slope_max)){
-      df_env <- df %>%
-        mutate(y_min = current * slope_min,
-               y_max = current * slope_max)
-
-      df_env <- rbind(rep(0, ncol(df_env)), df_env)
-
-      p <- p + geom_ribbon(data = df_env,
-                           aes(x = current, ymin = y_min, ymax = y_max),
-                           inherit.aes = FALSE, alpha = 0.15,
-                           color="green", fill="green")
+  output$predSlope <- renderText({
+    theory <- theoretical()
+    if (is.null(theory)) {
+      "Complete G3:H4 (N, uncertainty in N, L, uncertainty in L) to compute the predicted slope."
+    } else {
+      paste0("Predicted slope: ", theory$label, " T/A")
     }
-    p
   })
 
-  # Template download
+  output$plot <- renderPlot({
+    make_plot(raw_df(), fitted(), theoretical())
+  })
+
   output$template_download <- downloadHandler(
     filename = "Solenoid_data.xlsx",
-    content = function(file){
-      file.copy('www/Solenoid_data_template.xlsx', file)
+    content = function(file) {
+      if (!file.exists(TEMPLATE_FILE) || !file.copy(TEMPLATE_FILE, file)) {
+        stop("Could not copy the data-file template.")
+      }
     }
   )
 }
